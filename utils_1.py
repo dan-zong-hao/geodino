@@ -56,7 +56,7 @@ if DATASET == 'Vaihingen':
     train_ids = ['1', '3', '23', '26', '7', '11', '13', '28', '17', '32', '34', '37']
     test_ids = ['5', '21', '15', '30']
     Stride_Size = 32
-    epochs = 80
+    epochs = 50
     save_epoch = 1
     MAIN_FOLDER = FOLDER + 'Vaihingen/'
     DATA_FOLDER = MAIN_FOLDER + 'top/top_mosaic_09cm_area{}.tif'
