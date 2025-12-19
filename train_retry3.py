@@ -13,11 +13,11 @@ import torch.utils.data as data
 import torch.optim as optim
 import torch.optim.lr_scheduler
 import torch.nn.init
-from utils import *
+from utils_1 import *
 from torch.autograd import Variable
 from IPython.display import clear_output
 # from UNetFormer_DINO import UNetFormer2 as MFNet
-from UNetFormer_test19 import UNetFormer as MFNet
+from UNetFormer_retry2 import UNetFormer as MFNet
 from loss_test import CombinedLoss
 try:
     from urllib.request import URLopener
@@ -38,9 +38,9 @@ def set_seed(seed):
 SEED = 666
 set_seed(SEED)
 # 新增：TensorBoard 日志
-writer = SummaryWriter(log_dir="./runs/unetformer_test20")
+writer = SummaryWriter(log_dir="./runs/unetformer_retry3")
 
-net = MFNet(num_classes=N_CLASSES, dinov3_model_name="/home/csf1/modelscope/models/facebook/dinov3-vitl16-pretrain-lvd1689m", lora_last_k=24, use_MMST=True).cuda()
+net = MFNet(num_classes=N_CLASSES, dinov3_model_name="/home/csf1/modelscope/models/facebook/dinov3-vitl16-pretrain-lvd1689m", lora_last_k=24).cuda()
 
 params = 0
 for name, param in net.named_parameters():
@@ -256,91 +256,43 @@ def train(net, optimizer, epochs, scheduler=None, weights=WEIGHTS, save_epoch=1)
 
     iter_ = 0
     MIoU_best = 0.00
-    
-    # [参数设置] 
-    mmst_prob = 0.5     # 触发概率
-    mmst_w = 0.01       # 辅助损失权重 (参考 KLB)
-    align_w = 0.1       # 对齐损失权重
-    ignore_label = 255
-    
+    # criterion = CombinedLoss(ignore_index=255, use_aux=False).cuda()
     for e in range(1, epochs + 1):
+        
         net.train()
         epoch_loss = 0.0
         start_time = time.time()
         
         for batch_idx, (data, dsm, target) in enumerate(train_loader):
-            data = data.cuda(non_blocking=True)
-            dsm = dsm.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            # 决定本 batch 是否计算 MMST 损失
-            use_mmst_step = (random.random() < mmst_prob)
-            
-            # [优化建议]：如果本步不计算辅助Loss，暂时关闭模型内部的计算以节省显存
-            # net.use_MMST = use_mmst_step 
-            # 注意：如果像上面这样动态开关，下面的解包行需要像 test19 那样写 if/else
-            # 为了最小改动修复报错，我们假设保持 use_MMST=True 常开，仅修复解包顺序：
-
+            data, dsm, target = Variable(data.cuda()), Variable(dsm.cuda()), Variable(target.cuda())
+            optimizer.zero_grad()
             with autocast(device_type='cuda'):
-                # ==========================================
-                # [修复点 1] 修正解包顺序，与模型 return 保持一致
-                # 原代码: out, align_loss, aux_rgb, aux_dsm = ... (错误)
-                # ==========================================
-                out, aux_rgb, aux_dsm, align_loss = net(data, dsm, mode='Train')
-                
-                # 2. Main Loss
-                loss_main = loss_calc(out, target, weights) + align_w * align_loss
-                
-                loss_rgb = torch.tensor(0.0, device=data.device)
-                loss_dsm = torch.tensor(0.0, device=data.device)
-
-                # ==========================================
-                # 3. MMST Logic (Teacher-Student Distillation)
-                # ==========================================
-                if use_mmst_step:
-                    with torch.no_grad():
-                        # A. 生成掩码: 只有 Teacher 预测正确的地方才作为标签
-                        pred_teacher = out.detach().softmax(dim=1).argmax(dim=1)
-                        pred_cor = (pred_teacher == target)
-                        
-                        # B. 制作 Mask Label
-                        # 原始 target 中已经是 255 的保持 255
-                        # Teacher 预测错误的地方，设为 255 (ignore)
-                        mask_lbl = target.clone()
-                        mask_lbl[~pred_cor] = ignore_label
-                    
-                    # C. 计算 Student Loss
-                    # 使用 aux_rgb 直接预测，不需要再跑一遍 net(data, dsm_zeros)
-                    # 因为 aux_rgb 物理上就没连接 dsm 特征，等效于 dsm 被 mask 掉了
-                    loss_rgb = loss_calc(aux_rgb, mask_lbl, weights)
-                    loss_dsm = loss_calc(aux_dsm, mask_lbl, weights)
-
-                # 4. Total Loss
-                loss = loss_main + mmst_w * (loss_rgb + loss_dsm)
-
+                output, align_loss = net(data, dsm, mode='Train')
+                λ = 0.0
+                # loss = criterion(output, target) + λ * align_loss
+                # loss = criterion(output, target)
+                loss = loss_calc(output, target, weights) + λ * align_loss
+            # loss = CrossEntropy2d(output, target, weight=weights)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(net.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
-            
-            # Logging
-            epoch_loss += loss.item()
-            losses[iter_] = loss.item()
+            epoch_loss += loss.data
+            losses[iter_] = loss.data
             mean_losses[iter_] = np.mean(losses[max(0, iter_ - 100):iter_])
 
             if iter_ % 100 == 0:
                 clear_output()
-                print(
-                    f'Train (epoch {e}/{epochs}) [{batch_idx}/{len(train_loader)}]\t'
-                    f'MMST: {int(use_mmst_step)}\t'
-                    f'Loss: {loss.item():.4f} (Main: {loss_main.item():.4f}, '
-                    f'RGB: {loss_rgb.item():.4f}, DSM: {loss_dsm.item():.4f})'
-                )
+                rgb = np.asarray(255 * np.transpose(data.data.cpu().numpy()[0], (1, 2, 0)), dtype='uint8')
+                pred = np.argmax(output.data.cpu().numpy()[0], axis=0)
+                gt = target.data.cpu().numpy()[0]
+                print('Train (epoch {}/{}) [{}/{} ({:.0f}%)]\tLoss: {:.6f}\tAccuracy: {}'.format(
+                    e, epochs, batch_idx, len(train_loader),
+                    100. * batch_idx / len(train_loader), loss.data, accuracy(pred, gt)))
             iter_ += 1
-            del data, dsm, target, loss
+
+            del (data, target, loss)
 
         if scheduler is not None:
             scheduler.step()
@@ -348,26 +300,26 @@ def train(net, optimizer, epochs, scheduler=None, weights=WEIGHTS, save_epoch=1)
         if e % save_epoch == 0:
             train_time = time.time()
             print("Training time: {:.3f} seconds".format(train_time - start_time))
+            # We validate with the largest possible stride for faster computing
             epoch_loss /= len(train_loader)
-            
             net.eval()
             MIoU = test(net, test_ids, all=False, stride=Stride_Size)
             net.train()
-            
+            # 写入 TensorBoard
             writer.add_scalar("Loss/train", epoch_loss, e)
             writer.add_scalar("mIoU/val", MIoU, e)
             writer.add_scalar("LR", optimizer.param_groups[0]['lr'], e)
-            
             test_time = time.time()
-            print("Test time: {:.3f} seconds".format(test_time - train_time))
             
+            print("Test time: {:.3f} seconds".format(test_time - train_time))
             if MIoU > MIoU_best:
-                save_dir = './resultsv_test20'
-                import os
-                if not os.path.exists(save_dir): os.makedirs(save_dir)
-                torch.save(net.state_dict(), '{}/{}_epoch{}_{:.4f}'.format(save_dir, MODEL, e, MIoU))
+                if DATASET == 'Vaihingen':
+                    torch.save(net.state_dict(), './resultsv_retry3/{}_epoch{}_{}'.format(MODEL, e, MIoU))
+                elif DATASET == 'Potsdam':
+                    torch.save(net.state_dict(), './resultsp/{}_epoch{}_{}'.format(MODEL, e, MIoU))
+                elif DATASET == 'Hunan':
+                    torch.save(net.state_dict(), './resultsh_sar_test2loraall/{}_epoch{}_{}'.format(MODEL, e, MIoU))
                 MIoU_best = MIoU
-    
     writer.close()
     print('MIoU_best: ', MIoU_best)
 

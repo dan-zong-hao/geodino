@@ -13,11 +13,11 @@ import torch.utils.data as data
 import torch.optim as optim
 import torch.optim.lr_scheduler
 import torch.nn.init
-from utils import *
+from utils_1 import *
 from torch.autograd import Variable
 from IPython.display import clear_output
 # from UNetFormer_DINO import UNetFormer2 as MFNet
-from UNetFormer_test19 import UNetFormer as MFNet
+from UNetFormer_test21 import UNetFormer as MFNet
 from loss_test import CombinedLoss
 try:
     from urllib.request import URLopener
@@ -38,7 +38,7 @@ def set_seed(seed):
 SEED = 666
 set_seed(SEED)
 # 新增：TensorBoard 日志
-writer = SummaryWriter(log_dir="./runs/unetformer_test20")
+writer = SummaryWriter(log_dir="./runs/unetformer_test21")
 
 net = MFNet(num_classes=N_CLASSES, dinov3_model_name="/home/csf1/modelscope/models/facebook/dinov3-vitl16-pretrain-lvd1689m", lora_last_k=24, use_MMST=True).cuda()
 
@@ -137,29 +137,41 @@ from torch.optim.lr_scheduler import LambdaLR
 def is_lora_param(n):
     return ('lora_A' in n) or ('lora_B' in n)
 
-lora_params, head_params, norm_params = [], [], []
+def is_geo_param(n):
+    """识别几何先验生成器的参数"""
+    return 'geo_gen' in n
+
+lora_params, geo_params, norm_params, head_params = [], [], [], []
 
 for n, p in net.named_parameters():
     if not p.requires_grad:
         continue
     if is_lora_param(n):
         lora_params.append(p)
+    elif is_geo_param(n):
+        geo_params.append(p)  # 新增：几何先验参数单独分组
     elif any(nd in n for nd in ['norm', 'bn', 'bias', 'ln', 'LayerNorm']):
         norm_params.append(p)
     else:
         head_params.append(p)
 
 # ======================================================
-# 2. 优化器
+# 2. 优化器（为几何先验参数单独设置参数组）
 # ======================================================
 optimizer = optim.AdamW(
     [
+        # 几何先验参数：高学习率，无权重衰减
+        {'params': geo_params, 'lr': 5e-4, 'weight_decay': 0.0, 'name': 'geo_params'},
+        # 头部/Decoder参数：标准学习率，标准权重衰减
         {'params': head_params, 'lr': 1e-4, 'weight_decay': 1e-2},
-        {'params': norm_params, 'lr': 1e-4, 'weight_decay': 0.0},   # norm层不做wd
-        {'params': lora_params, 'lr': 3e-4, 'weight_decay': 0.0},   # LoRA略高lr，无正则
+        # Norm/Bias参数：标准学习率，无权重衰减
+        {'params': norm_params, 'lr': 1e-4, 'weight_decay': 0.0},
+        # LoRA参数：中等学习率，无权重衰减
+        {'params': lora_params, 'lr': 3e-4, 'weight_decay': 0.0},
     ],
     betas=(0.9, 0.999)
 )
+
 
 # ======================================================
 # 3. 调度器：Cosine + Warmup 改进版
@@ -362,7 +374,7 @@ def train(net, optimizer, epochs, scheduler=None, weights=WEIGHTS, save_epoch=1)
             print("Test time: {:.3f} seconds".format(test_time - train_time))
             
             if MIoU > MIoU_best:
-                save_dir = './resultsv_test20'
+                save_dir = './resultsv_test21'
                 import os
                 if not os.path.exists(save_dir): os.makedirs(save_dir)
                 torch.save(net.state_dict(), '{}/{}_epoch{}_{:.4f}'.format(save_dir, MODEL, e, MIoU))

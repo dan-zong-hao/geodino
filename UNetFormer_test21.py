@@ -14,6 +14,12 @@ import cfg as cfg
 import matplotlib.pyplot as plt
 import math
 from lora_utils_test import apply_dual_lora_to_vit_encoder
+from types import MethodType
+try:
+    from dinov3.layers.attention import SelfAttention
+except ImportError:
+    # 如果找不到路径，为了代码不报错，定义一个伪类（实际运行时请修正路径）
+    SelfAttention = nn.Module
 
 class Norm2d(nn.Module):
     def __init__(self, embed_dim):
@@ -480,6 +486,188 @@ def draw_features(feature, savename=''):
     visualize = cv2.applyColorMap(visualize, cv2.COLORMAP_JET)
     cv2.imwrite(savedir, visualize)
 
+# ==========================================
+# 1. 几何先验生成器
+# ==========================================
+class GeometryPriorGenerator(nn.Module):
+    """
+    修复版 GeoPrior：
+    1. 使用 softplus 保证参数为正且梯度非零
+    2. 合理初始化，从有意义的小正值开始
+    3. 支持可调节的温度参数
+    """
+    def __init__(self, input_size=256, patch_size=14, num_heads=16, init_scale=0.1):
+        super().__init__()
+        self.H_grid = input_size // patch_size
+        self.W_grid = input_size // patch_size
+        self.num_heads = num_heads
+        
+        # 可学习的温度参数，控制先验的影响强度
+        self.temperature = nn.Parameter(torch.ones(1) * 0.1)
+        
+        # --- A. 空间距离（归一化处理）---
+        y_idx = torch.arange(self.H_grid, dtype=torch.float32)
+        x_idx = torch.arange(self.W_grid, dtype=torch.float32)
+        grid_y, grid_x = torch.meshgrid(y_idx, x_idx, indexing='ij')
+        coords = torch.stack([grid_y.flatten(), grid_x.flatten()], dim=1) 
+        spatial_dist = torch.cdist(coords, coords, p=1).unsqueeze(0).unsqueeze(0)
+        
+        # 归一化到 [0, 1] 范围
+        max_dist = spatial_dist.max()
+        spatial_dist = spatial_dist / (max_dist + 1e-6)
+        self.register_buffer("spatial_dist", spatial_dist)
+
+        # --- B. 可学习参数（使用对数空间初始化）---
+        # 初始化为小负值，经过 softplus 后为小正值
+        # 这样可以保证梯度存在且能正常更新
+        self.log_alpha_spatial = nn.Parameter(torch.ones(1, num_heads, 1, 1) * np.log(init_scale))
+        self.log_alpha_depth   = nn.Parameter(torch.ones(1, num_heads, 1, 1) * np.log(init_scale))
+        self.log_alpha_rough   = nn.Parameter(torch.ones(1, num_heads, 1, 1) * np.log(init_scale))
+        
+        # 额外的偏置项，增强表达能力
+        self.bias_spatial = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+        self.bias_depth   = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+        self.bias_rough   = nn.Parameter(torch.zeros(1, num_heads, 1, 1))
+
+    def forward(self, dsm_map):
+        """
+        dsm_map: [B, 1, H_img, W_img]
+        返回: 几何先验偏置 [B, num_heads, N, N]，其中N = H_grid * W_grid
+        """
+        B = dsm_map.shape[0]
+        
+        # 1. DSM 特征提取
+        # ------------------------------------------------------------------
+        # 分支 A: 平均高度
+        dsm_avg = F.adaptive_avg_pool2d(dsm_map, (self.H_grid, self.W_grid))
+        
+        # 分支 B: 最大高度（锐化边缘）
+        dsm_max = F.adaptive_max_pool2d(dsm_map, (self.H_grid, self.W_grid))
+        
+        # 分支 C: 局部粗糙度（标准差）
+        dsm_sq = dsm_map ** 2
+        avg_sq = F.adaptive_avg_pool2d(dsm_sq, (self.H_grid, self.W_grid))
+        dsm_std = torch.sqrt(torch.clamp(avg_sq - dsm_avg ** 2, min=1e-6))
+
+        # ------------------------------------------------------------------
+
+        # 2. 准备 Tokens
+        h_tokens = dsm_max.flatten(2).transpose(1, 2)  # [B, N, 1]
+        r_tokens = dsm_std.flatten(2).transpose(1, 2)  # [B, N, 1]
+
+        # 3. 计算差异矩阵
+        # 高度差（Depth Prior）
+        depth_dist = torch.abs(h_tokens - h_tokens.transpose(1, 2)).unsqueeze(1)  # [B, 1, N, N]
+        # 粗糙度差（Roughness Prior）
+        rough_dist = torch.abs(r_tokens - r_tokens.transpose(1, 2)).unsqueeze(1)  # [B, 1, N, N]
+        
+        # 归一化
+        if depth_dist.max() > 0:
+            depth_dist = depth_dist / (depth_dist.max() + 1e-6)
+        if rough_dist.max() > 0:
+            rough_dist = rough_dist / (rough_dist.max() + 1e-6)
+
+        # 4. 计算 softplus 激活后的参数（保证正性且梯度非零）
+        alpha_spatial = F.softplus(self.log_alpha_spatial)  # 从 log 空间转换
+        alpha_depth   = F.softplus(self.log_alpha_depth)
+        alpha_rough   = F.softplus(self.log_alpha_rough)
+        
+        # 5. 融合先验（包含偏置项）
+        bias = (
+            alpha_spatial * self.spatial_dist + self.bias_spatial +
+            alpha_depth * depth_dist + self.bias_depth +
+            alpha_rough * rough_dist + self.bias_rough
+        )
+        
+        # 6. 应用温度参数并取负（距离越大，attention 应该越小）
+        bias = -bias * self.temperature
+        
+        # 扩展到 batch 维度
+        bias = bias.expand(B, -1, -1, -1)
+        
+        return bias
+
+# ==========================================
+# 2. Geometry Wrapper (Attention 包装器)
+# ==========================================
+
+class GeometryAwareAttention(nn.Module):
+    def __init__(self, original_attn_layer):
+        super().__init__()
+        self.original_layer = original_attn_layer
+
+    def forward(self, hidden_states, attention_mask=None, head_mask=None, output_attentions=False, **kwargs):
+        geo_bias = getattr(self, 'geometry_bias', None)
+        
+        # [Test13 修复]: 显式过滤极小值，防止全0 Tensor 破坏 Flash Attention 优化
+        if geo_bias is not None and geo_bias.abs().max() < 1e-6:
+            geo_bias = None
+
+        if geo_bias is not None:
+            B, seq_len, _ = hidden_states.shape
+            num_patches = geo_bias.shape[-1]
+            
+            # 处理 CLS/Register tokens
+            if seq_len > num_patches:
+                num_special_tokens = seq_len - num_patches
+                if geo_bias.device != hidden_states.device:
+                    geo_bias = geo_bias.to(hidden_states.device)
+                geo_bias = F.pad(geo_bias, (num_special_tokens, 0, num_special_tokens, 0), value=0.0)
+            
+            if geo_bias.device != hidden_states.device:
+                geo_bias = geo_bias.to(hidden_states.device)
+            if geo_bias.dtype != hidden_states.dtype:
+                geo_bias = geo_bias.to(dtype=hidden_states.dtype)
+
+            # 注入 Bias
+            if attention_mask is not None:
+                if attention_mask.dtype == torch.bool:
+                    dtype_min = torch.finfo(hidden_states.dtype).min
+                    base_mask = torch.zeros_like(geo_bias)
+                    base_mask.masked_fill_(~attention_mask, dtype_min)
+                    attention_mask = base_mask + geo_bias
+                else:
+                    attention_mask = attention_mask + geo_bias
+            else:
+                attention_mask = geo_bias
+
+        return self.original_layer(
+            hidden_states, 
+            attention_mask=attention_mask, 
+            head_mask=head_mask, 
+            output_attentions=output_attentions, 
+            **kwargs
+        )
+    
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.original_layer, name)
+
+def replace_attention_with_geometry_aware(model):
+    modules_to_replace = []
+    for name, module in model.named_modules():
+        for child_name, child in module.named_children():
+            if ("Attention" in child.__class__.__name__ 
+                and hasattr(child, "q_proj") 
+                and not isinstance(child, GeometryAwareAttention)):
+                modules_to_replace.append((name, module, child_name, child))
+
+    print(f"🔍 扫描完成，共发现 {len(modules_to_replace)} 个目标 Attention 层。")
+    count = 0
+    for name, parent, child_name, child in modules_to_replace:
+        if isinstance(getattr(parent, child_name), GeometryAwareAttention):
+            continue
+        wrapped_layer = GeometryAwareAttention(child)
+        setattr(parent, child_name, wrapped_layer)
+        count += 1
+    print(f"✅ 成功替换了 {count} 个 Attention 层。")
+
+
+# ==========================================
+# 3. UNetFormer 主类
+# ==========================================
 class UNetFormer(nn.Module):
     def __init__(self,
                  decode_channels=64,
@@ -488,74 +676,78 @@ class UNetFormer(nn.Module):
                  num_classes=6,
                  dinov3_model_name="/root/autodl-tmp/modelscope/hub/facebook/dinov3-vitl16-pretrain-sat493m",
                  freeze_backbone=True,
-                 use_lora=True,        # 新增：是否启用 LoRA
+                 use_lora=True,
                  lora_rank=8, lora_alpha=16, lora_dropout=0.0,
-                 lora_last_k=8,        # 新增：对最后 k 层注入 LoRA，ViT-L 一共 24 层→默认最后 8 层
-                 lora_targets=('q_proj', 'k_proj', 'v_proj', 'o_proj'),  # 默认只在注意力的 Q/V 上做 LoRA
+                 lora_last_k=8,
+                 lora_targets=('q_proj', 'k_proj', 'v_proj', 'o_proj'),
                  use_MMST=False
                 ):
         super().__init__()
-        args = cfg.parse_args()
+        # args = cfg.parse_args() # 确保 cfg 已定义
 
-        # 1) backbone & 预处理
+        # 1) 加载 Backbone
         self.use_MMST = use_MMST
-        self.image_encoder = AutoModel.from_pretrained(dinov3_model_name)
+        self.image_encoder = AutoModel.from_pretrained(dinov3_model_name, trust_remote_code=True)
+
+        # 2) 优先应用 LoRA (关键顺序修改)
+        # 必须在 Wrapping 之前应用 LoRA，以确保 LoRA 能找到原始的 Linear 层
         if use_lora:
             total_layers = 24  # ViT-L/16
-            lora_layers = list(range(total_layers - lora_last_k, total_layers))  # 例如 [16..23]
+            lora_layers = list(range(total_layers - lora_last_k, total_layers))
             apply_dual_lora_to_vit_encoder(
                 self.image_encoder,
                 layer_ids=lora_layers,
                 targets=lora_targets,
                 r=lora_rank, alpha=lora_alpha, dropout=lora_dropout
             )
-            # 覆盖 freeze_backbone：LoRA 会自动只训练 lora_A/B
-            freeze_backbone = False
+            freeze_backbone = False # LoRA 模式下自动解冻 LoRA 参数
+
+        # 3) 替换 Attention 为几何感知 Wrapper
+        # 此时 Attention 内部可能已经是 DualLoRALinear 了，Wrapper 会将其视为黑盒包裹起来，不影响
+        replace_attention_with_geometry_aware(self.image_encoder)
+
+        # 4) 初始化几何先验生成器
+        embed_dim = self.image_encoder.embed_dim if hasattr(self.image_encoder, "embed_dim") else 1024
+        num_heads = self.image_encoder.num_heads if hasattr(self.image_encoder, "num_heads") else 16
+        patch_size = self.image_encoder.patch_size if hasattr(self.image_encoder, "patch_size") else 16
+        
+        self.geo_gen = GeometryPriorGenerator(
+            input_size=256, 
+            patch_size=patch_size, 
+            num_heads=num_heads
+        )
+
+        # 5) 冻结控制
+        if freeze_backbone:
+            for p in self.image_encoder.parameters():
+                p.requires_grad = False
+        
+        # 确保几何先验参数可训练
+        for p in self.geo_gen.parameters():
+            p.requires_grad = True
+
         self.transform = self.make_transform(256)
 
+        # 后续 FPN / Decoder 定义 (保持不变)
         dinov3_out = 1024
         out_c = 256
         encoder_channels = (out_c, out_c, out_c, out_c)
-
-        # 2) 线性投影（按层），把 token 维 1024 → 256
-        #    选更分散的层位：ViT-L/16 共24层(0..23)，这里用 [2,6,12,23]
         self.layer_ids = [5, 11, 17, 23]
-        # self.projections = nn.ModuleList([nn.Linear(dinov3_out, out_c) for _ in range(4)])
-        # 2 套线性投影（RGB / DSM 各自独立）
-        # self.proj_rgb = nn.ModuleList([nn.Linear(dinov3_out, out_c) for _ in range(4)])
-        # self.proj_dsm = nn.ModuleList([nn.Linear(dinov3_out, out_c) for _ in range(4)])
-        # 共享 Linear + 独立 BatchNorm
+        
         self.proj_shared = nn.ModuleList([nn.Linear(dinov3_out, out_c) for _ in range(4)])
         self.bn_rgb = nn.ModuleList([nn.BatchNorm1d(out_c) for _ in range(4)])
         self.bn_dsm = nn.ModuleList([nn.BatchNorm1d(out_c) for _ in range(4)])
 
+        self.fpn1x = nn.Sequential(nn.ConvTranspose2d(out_c, out_c, 2, 2), Norm2d(out_c), nn.GELU(), nn.ConvTranspose2d(out_c, out_c, 2, 2))
+        self.fpn2x = nn.Sequential(nn.ConvTranspose2d(out_c, out_c, 2, 2))
+        self.fpn3x = nn.Identity()
+        self.fpn4x = nn.MaxPool2d(2, 2)
 
-        # 3) 你原有的 FPN 分支（不改）
-        self.fpn1x = nn.Sequential(
-            nn.ConvTranspose2d(out_c, out_c, kernel_size=2, stride=2),  # 16->32
-            Norm2d(out_c),
-            nn.GELU(),
-            nn.ConvTranspose2d(out_c, out_c, kernel_size=2, stride=2),  # 32->64
-        )
-        self.fpn2x = nn.Sequential(
-            nn.ConvTranspose2d(out_c, out_c, kernel_size=2, stride=2),  # 16->32
-        )
-        self.fpn3x = nn.Identity()                                     # 16->16
-        self.fpn4x = nn.MaxPool2d(kernel_size=2, stride=2)             # 16->8
-
-        self.fpn1y = nn.Sequential(
-            nn.ConvTranspose2d(out_c, out_c, kernel_size=2, stride=2),
-            nn.BatchNorm2d(out_c),
-            nn.GELU(),
-            nn.ConvTranspose2d(out_c, out_c, kernel_size=2, stride=2),
-        )
-        self.fpn2y = nn.Sequential(
-            nn.ConvTranspose2d(out_c, out_c, kernel_size=2, stride=2),
-        )
+        self.fpn1y = nn.Sequential(nn.ConvTranspose2d(out_c, out_c, 2, 2), nn.BatchNorm2d(out_c), nn.GELU(), nn.ConvTranspose2d(out_c, out_c, 2, 2))
+        self.fpn2y = nn.Sequential(nn.ConvTranspose2d(out_c, out_c, 2, 2))
         self.fpn3y = nn.Identity()
-        self.fpn4y = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.fpn4y = nn.MaxPool2d(2, 2)
 
-        # 4) 融合 & 解码（保持不变）
         self.fusion1 = SEFusion(out_c)
         self.fusion2 = SEFusion(out_c)
         self.fusion3 = SEFusion(out_c)
@@ -565,12 +757,6 @@ class UNetFormer(nn.Module):
         self.decoder_rgb  = Decoder(encoder_channels, decode_channels, dropout, window_size, num_classes)
         self.decoder_dsm  = Decoder(encoder_channels, decode_channels, dropout, window_size, num_classes)
 
-
-        # 5) 可选冻结
-        if freeze_backbone:
-            for _, p in self.image_encoder.named_parameters():
-                p.requires_grad = False
-
     @staticmethod
     def make_transform(resize_size: int = 256):
         return v2.Compose([
@@ -579,106 +765,85 @@ class UNetFormer(nn.Module):
             v2.ToDtype(torch.float32, scale=True),
             v2.Normalize(mean=(0.430, 0.411, 0.296), std=(0.213, 0.156, 0.143)),
         ])
-    # def make_transform(resize_size: int = 256):
-    #     to_tensor = v2.ToImage()
-    #     resize = v2.Resize((resize_size, resize_size), antialias=True)
-    #     to_float = v2.ToDtype(torch.float32, scale=True)
-    #     normalize = v2.Normalize(
-    #         mean=(0.485, 0.456, 0.406),
-    #         std=(0.229, 0.224, 0.225),
-    #     )
-    #     return v2.Compose([to_tensor, resize, to_float, normalize])
 
-    @staticmethod
-    def _strip_special_tokens(tokens):
-        """
-        tokens: [B, T, C]，尝试去掉 1 或 5 个特殊 token（CLS [+ 4 register]）
-        使得剩余 N 为完全平方数 -> 可 reshape 成 HxW
-        """
+    def _strip_special_tokens(self, tokens):
+        # 保持你原来的 strip 逻辑
         B, T, C = tokens.shape
         for k in (1, 5):
             N = T - k
             r = int(math.isqrt(N))
-            if r * r == N:
-                return tokens[:, k:, :], r
+            if r * r == N: return tokens[:, k:, :], r
         for k in range(0, 10):
             N = T - k
             if N <= 0: break
             r = int(math.isqrt(N))
-            if r * r == N:
-                return tokens[:, k:, :], r
-        raise ValueError(f"Cannot infer special token count from tokens shape {tokens.shape}")
-
+            if r * r == N: return tokens[:, k:, :], r
+        raise ValueError(f"Cannot infer tokens: {tokens.shape}")
 
     def _tokens_to_map_with_bn(self, toks, proj, bn):
-        toks, _ = self._strip_special_tokens(toks)  # [B,N,C]
-        x = proj(toks)                              # [B,N,256]
-        # BN 是针对特征维做的，这里 reshape [B*N,256]
+        toks, _ = self._strip_special_tokens(toks)
+        x = proj(toks)
         B, N, C = x.shape
         x = bn(x.reshape(-1, C)).reshape(B, N, C)
         H = int(math.isqrt(N))
-        x = x.reshape(B, H, H, C).permute(0, 3, 1, 2).contiguous()  # [B,256,H,W]
-        return x
-
-    @staticmethod
-    def local_infonce(fx, fy, tau=0.07, num_neg=256):
-        assert fx.dim() == 4 and fy.dim() == 4, f"{fx.shape=}, {fy.shape=}"
-        B, C, H, W = fx.shape
-        fx = F.normalize(fx.flatten(2).transpose(1,2), dim=-1)  # [B,HW,C]
-        fy = F.normalize(fy.flatten(2).transpose(1,2), dim=-1)
-        
-        sim_matrix = torch.bmm(fx, fy.transpose(1,2)) / tau      # [B,HW,HW]
-        pos = torch.diagonal(sim_matrix, dim1=1, dim2=2)         # [B,HW]
-        # 负样本来自同图像的不同位置
-        loss = -torch.log(torch.exp(pos) / torch.exp(sim_matrix).sum(-1))
-        return loss.mean()
-    # @staticmethod
-    # def local_infonce(fx, fy, tau=0.07, num_neg=256):
-    #     assert fx.dim() == 4 and fy.dim() == 4, f"{fx.shape=}, {fy.shape=}"
-    #     B, C, H, W = fx.shape
-    #     fx = F.normalize(fx.flatten(2).transpose(1, 2), dim=-1)  # [B,HW,C]
-    #     fy = F.normalize(fy.flatten(2).transpose(1, 2), dim=-1)
-
-    #     sim = torch.bmm(fx, fy.transpose(1, 2)) / tau            # [B,HW,HW]
-    #     pos = sim.diagonal(dim1=1, dim2=2)                       # [B,HW]
-
-    #     # 稳定版：-log( exp(pos)/sum exp(sim) ) == -(pos - logsumexp(sim))
-    #     loss = -(pos - sim.logsumexp(dim=-1))                    # [B,HW]
-    #     return loss.mean()
+        return x.reshape(B, H, H, C).permute(0, 3, 1, 2).contiguous()
 
     def forward(self, x, y, mode='Train'):
         H_img, W_img = x.size()[-2:]
-        # DSM 1ch -> 3ch
-        y = torch.unsqueeze(y, dim=1).repeat(1, 3, 1, 1)
-
+        # 1. 预处理输入
+        # DSM: (B, H, W) -> (B, 3, H, W) -> Transform
+        y_in = self.transform(torch.unsqueeze(y, dim=1).repeat(1, 3, 1, 1))
+        # RGB: Transform
         x = self.transform(x)
-        y = self.transform(y)
 
-        # 取 hidden_states
-        self.image_encoder.set_modality('rgb')
-        out_x = self.image_encoder(x, output_hidden_states=True)
-        self.image_encoder.set_modality('dsm')
-        out_y = self.image_encoder(y, output_hidden_states=True)
+        # 2. 生成几何 Bias (仅供 RGB 分支使用)
+        # y.unsqueeze(1) 变成 (B, 1, H, W) 以适配 AdaptiveAvgPool
+        geo_bias = self.geo_gen(y.unsqueeze(1)) 
+        
+        # 获取所有被包裹的 Attention 层
+        att_layers = [m for m in self.image_encoder.modules() if isinstance(m, GeometryAwareAttention)]
 
-        # 5) 四层：变成四个 [B,256,16,16] 的 feature map
-        # feats_x = []
-        # feats_y = []
-        # for i, lid in enumerate(self.layer_ids):
-        #     fx = self._tokens_to_map(out_x.hidden_states[lid], self.proj_rgb[i])
-        #     fy = self._tokens_to_map(out_y.hidden_states[lid], self.proj_dsm[i])
-        #     feats_x.append(fx)
-        #     feats_y.append(fy)
+        # ==========================================
+        # [Pass 1] RGB 分支 (启用几何先验)
+        # ==========================================
+        # 1.1 挂载 Bias
+        for m in att_layers:
+            m.geometry_bias = geo_bias
+        
+        try:
+            # 1.2 设置模态 & 前向传播
+            if hasattr(self.image_encoder, 'set_modality'): 
+                self.image_encoder.set_modality('rgb')
+            
+            # 此时 Attention 会读取 geo_bias 并注入计算
+            out_x = self.image_encoder(x, output_hidden_states=True)
+            
+        finally:
+            # 1.3 立即清理 Bias (关键步骤!)
+            # 无论 RGB pass 是否成功，必须确保 Bias 被移除，以免污染后续操作
+            for m in att_layers:
+                m.geometry_bias = None
+
+        # ==========================================
+        # [Pass 2] DSM 分支 (保持原样，不使用几何先验)
+        # ==========================================
+        # 此时 m.geometry_bias 已经是 None 了
+        # GeometryAwareAttention 会直接透传调用原始层，相当于没有任何修改
+        if hasattr(self.image_encoder, 'set_modality'): 
+            self.image_encoder.set_modality('dsm')
+            
+        out_y = self.image_encoder(y_in, output_hidden_states=True)
+
+        # ==========================================
+        # [后续] FPN, Fusion, Decoder (保持不变)
+        # ==========================================
         feats_x, feats_y = [], []
         for i, lid in enumerate(self.layer_ids):
-            fx = self._tokens_to_map_with_bn(out_x.hidden_states[lid],
-                                            self.proj_shared[i], self.bn_rgb[i])
-            fy = self._tokens_to_map_with_bn(out_y.hidden_states[lid],
-                                            self.proj_shared[i], self.bn_dsm[i])
+            fx = self._tokens_to_map_with_bn(out_x.hidden_states[lid], self.proj_shared[i], self.bn_rgb[i])
+            fy = self._tokens_to_map_with_bn(out_y.hidden_states[lid], self.proj_shared[i], self.bn_dsm[i])
             feats_x.append(fx)
             feats_y.append(fy)
 
-        # 6) 走你原来的 FPN 分支：输入均为 [B,256,16,16]
-        #    输出分别是 [64,64] / [32,32] / [16,16] / [8,8]
         res1x = self.fpn1x(feats_x[0])
         res2x = self.fpn2x(feats_x[1])
         res3x = self.fpn3x(feats_x[2])
@@ -689,30 +854,22 @@ class UNetFormer(nn.Module):
         res3y = self.fpn3y(feats_y[2])
         res4y = self.fpn4y(feats_y[3])
 
-        # align_loss = 0.0
-        # for fx, fy in zip(feats_x, feats_y):
-        #     # 归一化后计算像素级余弦差异
-        #     fx_norm = F.normalize(fx, dim=1)
-        #     fy_norm = F.normalize(fy, dim=1)
-        #     # 1 - cosine_similarity ∈ [0,2]
-        #     cos_sim = torch.sum(fx_norm * fy_norm, dim=1, keepdim=True)
-        #     align_loss += torch.mean(1.0 - cos_sim)
-        # align_loss = align_loss / len(feats_x)  # 平均到4层
-        align_loss = 0.0
-        # for fx, fy in zip(feats_x, feats_y):
-        #     align_loss += self.local_infonce(fx, fy)
-        # align_loss /= len(feats_x)
+        align_loss = torch.tensor(0.0, device=x.device)
+        # if hasattr(self, 'local_infonce'):
+        #     for fx, fy in zip(feats_x, feats_y):
+        #         align_loss += self.local_infonce(fx, fy)
+        #     align_loss /= len(feats_x)
 
-        # 7) 融合（与你原先一致）
-        res1 = self.fusion1(res1x, res1y)  # [B,256,64,64]
-        res2 = self.fusion2(res2x, res2y)  # [B,256,32,32]
-        res3 = self.fusion3(res3x, res3y)  # [B,256,16,16]
-        res4 = self.fusion4(res4x, res4y)  # [B,256, 8, 8]
+        res1 = self.fusion1(res1x, res1y)
+        res2 = self.fusion2(res2x, res2y)
+        res3 = self.fusion3(res3x, res3y)
+        res4 = self.fusion4(res4x, res4y)
 
-        # 8) 解码回原图大小
-        out = self.decoder(res1, res2, res3, res4, H_img, W_img)
+        out = self.decoder(res1, res2, res3, res4, x.size(-2), x.size(-1))
         if self.use_MMST and mode == "Train":
             aux_rgb  = self.decoder_rgb (res1x, res2x, res3x, res4x, H_img, W_img)
             aux_dsm  = self.decoder_dsm (res1y, res2y, res3y, res4y, H_img, W_img)
             return out, aux_rgb, aux_dsm, align_loss
+        
         return out, align_loss
+
