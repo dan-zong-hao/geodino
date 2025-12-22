@@ -17,7 +17,7 @@ from utils_1 import *
 from torch.autograd import Variable
 from IPython.display import clear_output
 # from UNetFormer_DINO import UNetFormer2 as MFNet
-from UNetFormer_test17 import UNetFormer as MFNet
+from UNetFormer_test23 import UNetFormer as MFNet
 from loss_test import CombinedLoss
 try:
     from urllib.request import URLopener
@@ -25,6 +25,7 @@ except ImportError:
     from urllib import URLopener
 import math
 from torch.utils.tensorboard import SummaryWriter
+
 
 def set_seed(seed):
     random.seed(seed)                 # 控制 ISPRS_dataset 里用到的 random.randint / random.random
@@ -38,7 +39,7 @@ def set_seed(seed):
 SEED = 666
 set_seed(SEED)
 # 新增：TensorBoard 日志
-writer = SummaryWriter(log_dir="./runs/unetformer_test17")
+writer = SummaryWriter(log_dir="/home/csf1/Documents/DINOv3/testsv/runs/unetformer_test23")
 
 net = MFNet(num_classes=N_CLASSES, dinov3_model_name="/home/csf1/modelscope/models/facebook/dinov3-vitl16-pretrain-lvd1689m", lora_last_k=24).cuda()
 
@@ -81,7 +82,14 @@ print('Others:       ', params - params1)
 print("training : ", len(train_ids))
 print("testing : ", len(test_ids))
 train_set = ISPRS_dataset(train_ids, cache=CACHE)
-train_loader = torch.utils.data.DataLoader(train_set,batch_size=BATCH_SIZE)
+train_loader = torch.utils.data.DataLoader(train_set,
+    batch_size=BATCH_SIZE,
+    shuffle=False,               # dataset 内部已随机抽样
+    num_workers=8,               # 先从 8 试，按 CPU 核数可提高到 12/16
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=4,
+    drop_last=True)
 
 # base_lr = 1e-3
 # optimizer = torch.optim.AdamW(
@@ -325,11 +333,11 @@ def train(net, optimizer, epochs, scheduler=None, weights=WEIGHTS, save_epoch=1)
             print("Test time: {:.3f} seconds".format(test_time - train_time))
             if MIoU > MIoU_best:
                 if DATASET == 'Vaihingen':
-                    torch.save(net.state_dict(), './resultsv_test17/{}_epoch{}_{}'.format(MODEL, e, MIoU))
+                    torch.save(net.state_dict(), '/home/csf1/Documents/DINOv3/testsv/resultsv_test23/{}_epoch{}_{}'.format(MODEL, e, MIoU))
                 elif DATASET == 'Potsdam':
                     torch.save(net.state_dict(), './resultsp/{}_epoch{}_{}'.format(MODEL, e, MIoU))
                 elif DATASET == 'Hunan':
-                    torch.save(net.state_dict(), './resultsh_sar_test2loraall/{}_epoch{}_{}'.format(MODEL, e, MIoU))
+                    torch.save(net.state_dict(), './resultsh_test23/{}_epoch{}_{}'.format(MODEL, e, MIoU))
                 MIoU_best = MIoU
     writer.close()
     print('MIoU_best: ', MIoU_best)
